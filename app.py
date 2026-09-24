@@ -10,6 +10,7 @@
 """
 
 import hashlib
+import json
 from datetime import datetime, timezone, timedelta
 
 from domain import load_config
@@ -66,6 +67,10 @@ class SafeguardingApp:
         self.suggestions = {}        # suggestion_id -> 合并建议
         self.callbacks = {}          # callback_id -> 首次处理结果
         self.notifications = []      # 通知外发箱（抽象渠道）
+        self.preservation_orders = {}  # order_id -> 保全令投影
+        self.manifests = {}          # manifest_id -> 材料清单投影
+        self.conflicts = {}          # conflict_id -> 移交冲突复核
+        self._handoff_keys = {}      # (incident_id, 接收机构, 用途) -> 最新保全令
         self._suggestion_keys = set()
         self._replay()
         self.store.subscribe(self._apply)
@@ -427,6 +432,100 @@ class SafeguardingApp:
         if p["callback_id"] not in self.callbacks:
             self.callbacks[p["callback_id"]] = p["result"]
 
+    # ------------------------------------------------------- 保全移交投影
+    def _on_preservation_order_issued(self, p):
+        order = {
+            "order_id": p["order_id"], "incident_id": p["incident_id"],
+            "case_no": p.get("case_no"), "version": p["version"],
+            "purpose": p["purpose"], "receiver": p["receiver"],
+            "field_scope": list(p["field_scope"]),
+            "issued_at": p["issued_at"], "expires_at": p["expires_at"],
+            "issued_by": p["issued_by"],
+            "basis": p.get("basis", "按案件与用途依法保全"),
+            "supersedes": p.get("supersedes"),
+            "status": "active",
+            "manifest_id": None,
+            "expected_receipts": list(p.get("expected_receipts", [])),
+            "received_receipts": {},
+            "extensions": [],
+        }
+        self.preservation_orders[p["order_id"]] = order
+        self._handoff_keys[self._handoff_key(
+            p["incident_id"], p["receiver"].get("org_code"), p["purpose"])] = p["order_id"]
+
+    def _on_preservation_order_superseded(self, p):
+        order = self.preservation_orders.get(p["order_id"])
+        if order:
+            order["status"] = "superseded"
+            order["superseded_by"] = p["superseded_by"]
+
+    def _on_preservation_extended(self, p):
+        order = self.preservation_orders.get(p["order_id"])
+        if order:
+            order["extensions"].append({
+                "extended_at": p["at"], "previous_expires_at": p["previous_expires_at"],
+                "new_expires_at": p["new_expires_at"], "reason": p["reason"],
+                "by": p["by"], "judicial": p.get("judicial", False),
+            })
+            order["expires_at"] = p["new_expires_at"]
+
+    def _on_manifest_generated(self, p):
+        manifest = {
+            "manifest_id": p["manifest_id"], "order_id": p["order_id"],
+            "incident_id": p["incident_id"], "order_version": p["order_version"],
+            "generated_at": p["generated_at"], "digest": p["digest"],
+            "items": p["items"],
+            "surrender_ack": None,
+            "receiver_ack": None,
+            "status": "pending_ack",
+            "events": [],
+        }
+        self.manifests[p["manifest_id"]] = manifest
+        order = self.preservation_orders.get(p["order_id"])
+        if order:
+            order["manifest_id"] = p["manifest_id"]
+
+    def _on_manifest_acknowledged(self, p):
+        manifest = self.manifests.get(p["manifest_id"])
+        if manifest:
+            ack = {"by": p["by"], "by_role": p["by_role"], "party": p["party"], "at": p["at"],
+                   "note": p.get("note")}
+            if p["party"] == "surrender":
+                manifest["surrender_ack"] = ack
+            else:
+                manifest["receiver_ack"] = ack
+            if manifest["surrender_ack"] and manifest["receiver_ack"]:
+                manifest["status"] = "acknowledged"
+
+    def _on_manifest_event_appended(self, p):
+        manifest = self.manifests.get(p["manifest_id"])
+        if manifest:
+            manifest["events"].append({
+                "kind": p["kind"], "at": p["at"], "by": p.get("by"),
+                "by_role": p.get("by_role"), "detail": p.get("detail", {}),
+            })
+            if p["kind"] in ("partial_rejection", "returned"):
+                manifest["status"] = p["kind"]
+            # 补件只作为后续事件追加，先前签认回执与清单状态均不改写
+
+    def _on_handoff_conflict_raised(self, p):
+        self.conflicts[p["conflict_id"]] = {
+            "conflict_id": p["conflict_id"], "incident_id": p["incident_id"],
+            "order_id": p["order_id"], "existing_manifest_id": p["existing_manifest_id"],
+            "reason": p["reason"], "differences": p.get("differences", []),
+            "raised_at": p["at"], "status": "open",
+            "resolved_by": None, "resolved_at": None, "decision": None,
+        }
+
+    def _on_handoff_conflict_resolved(self, p):
+        conflict = self.conflicts.get(p["conflict_id"])
+        if conflict:
+            conflict["status"] = "resolved"
+            conflict["resolved_by"] = p["by"]
+            conflict["resolved_at"] = p["at"]
+            conflict["decision"] = p["decision"]
+            conflict["note"] = p.get("note")
+
     # ------------------------------------------------------------- 严重度确认
     def confirm_severity(self, incident_id, severity, actor):
         _require(actor, ("俱乐部保护专员", "俱乐部值班主管"))
@@ -600,6 +699,8 @@ class SafeguardingApp:
             raise AppError("误报申诉存续期间不可撤回证据留存授权")
         if "evidence_storage" in scopes and self._has_executed(incident_id, "police_report"):
             raise AppError("已报案移交的事件处于司法程序中，证据留存授权不可单独撤回")
+        if "evidence_storage" in scopes and self._has_active_preservation(incident_id):
+            raise AppError("存在尚未到期的依法保全令，最小材料须继续留存，证据留存授权不可单独撤回")
         self._append("consent_revoked", {
             "incident_id": incident_id, "scopes": scopes,
             "by": actor.get("name"), "at": now_iso(),
@@ -829,6 +930,348 @@ class SafeguardingApp:
             return None
         return next((e for e in incident["evidence"] if e["content_ref"] == url), None)
 
+    # ---------------------------------------------------------- 材料保全移交
+    def _handoff_key(self, incident_id, org_code, purpose):
+        return (incident_id, org_code, purpose)
+
+    def issue_preservation_order(self, incident_id, payload, actor):
+        """法务按案件+用途签发带版本、期限、字段范围的保全令；系统随即固化清单与摘要。
+
+        重复移交（同事件+同接收机构+同用途）不发通知、不生成第二份清单：
+        拟交内容与已签认清单一致则返回既有令；不一致则进入冲突复核。
+        """
+        _require(actor, (self.config.handoff["签发角色"],))
+        inc = self._get_incident(incident_id)
+        purpose = payload.get("purpose")
+        if not self.config.is_valid_handoff_purpose(purpose):
+            raise AppError(f"未知保全用途：{purpose}")
+        receiver = payload.get("receiver") or {}
+        org_code = receiver.get("org_code")
+        if not org_code:
+            raise AppError("必须指定接收机构 receiver.org_code")
+        field_scope = payload.get("field_scope")
+        if not field_scope:
+            raise AppError("保全令必须声明字段范围 field_scope")
+        unknown_fields = [f for f in field_scope if not self.config.is_configured_handoff_field(f)]
+        if unknown_fields:
+            raise AppError(f"未知材料字段：{unknown_fields}")
+        # 司法移交必须包含依法最小保全字段
+        if purpose == "judicial_transfer":
+            missing_min = [f for f in self.config.minimal_preservation_fields if f not in field_scope]
+            if missing_min:
+                raise AppError(f"司法移交的字段范围必须包含最小保全字段：{missing_min}")
+
+        expires_at = self._resolve_expiry(payload, purpose)
+        key = self._handoff_key(incident_id, org_code, purpose)
+        existing_id = self._handoff_keys.get(key)
+        if existing_id:
+            return self._handle_repeat_handoff(
+                inc, self.preservation_orders[existing_id], field_scope, actor)
+
+        order_id = new_id("ord")
+        at = now_iso()
+        self._append("preservation_order_issued", {
+            "order_id": order_id, "incident_id": incident_id,
+            "case_no": payload.get("case_no"), "version": 1,
+            "purpose": purpose, "receiver": receiver,
+            "field_scope": field_scope, "issued_at": at, "expires_at": expires_at,
+            "issued_by": actor.get("name"),
+            "basis": payload.get("basis", "按案件与用途依法保全"),
+            "expected_receipts": payload.get("expected_receipts", []),
+        })
+        manifest = self._generate_manifest(self.preservation_orders[order_id], inc, at)
+        self._notify_handoff(incident_id, order_id, manifest["manifest_id"], at)
+        return {"order_id": order_id, "version": 1,
+                "manifest_id": manifest["manifest_id"], "duplicate": False}
+
+    def _handle_repeat_handoff(self, inc, order, field_scope, actor):
+        """重复移交：幂等返回或转冲突复核，绝不另发通知/另造清单。"""
+        existing = self.manifests.get(order["manifest_id"])
+        current_items = self._build_items(inc, field_scope)
+        current_digest = self._digest_of(order["order_id"], order["version"], current_items)
+        differences = []
+        if existing:
+            if set(field_scope) != set(order["field_scope"]):
+                differences.append("字段范围与已签认保全令不一致")
+            if current_digest != existing["digest"]:
+                old = {i["field_code"]: i["item_sha256"] for i in existing["items"]}
+                for item in current_items:
+                    if old.get(item["field_code"]) != item["item_sha256"]:
+                        differences.append(f"字段 {item['field_code']} 内容已变化")
+        if not differences:
+            return {"order_id": order["order_id"], "version": order["version"],
+                    "manifest_id": order["manifest_id"], "duplicate": True,
+                    "note": "重复移交：内容一致，沿用既有清单，不重复通知"}
+        conflict_id = new_id("cfl")
+        at = now_iso()
+        self._append("handoff_conflict_raised", {
+            "conflict_id": conflict_id, "incident_id": inc["incident_id"],
+            "order_id": order["order_id"], "existing_manifest_id": order["manifest_id"],
+            "reason": "重复移交但拟交内容与已签认清单不一致",
+            "differences": differences, "at": at,
+        })
+        return {"order_id": order["order_id"], "duplicate": True, "conflict_id": conflict_id,
+                "note": "重复移交内容发生变化，已进入冲突复核，未生成第二份清单、未重复通知"}
+
+    def resolve_handoff_conflict(self, conflict_id, decision, actor, note=None):
+        _require(actor, ("法务复核员", "俱乐部保护专员"))
+        conflict = self.conflicts.get(conflict_id)
+        if not conflict:
+            raise AppError("冲突复核任务不存在", 404)
+        if conflict["status"] != "open":
+            raise AppError("该冲突已复核")
+        if decision not in ("issue_new_version", "keep_existing"):
+            raise AppError("decision 仅支持 issue_new_version/keep_existing")
+        at = now_iso()
+        new_order_id = None
+        if decision == "issue_new_version":
+            inc = self._get_incident(conflict["incident_id"])
+            old = self.preservation_orders[conflict["order_id"]]
+            new_order_id = self._issue_new_version(old, inc, actor, at)
+        self._append("handoff_conflict_resolved", {
+            "conflict_id": conflict_id, "decision": decision,
+            "by": actor.get("name"), "at": at, "note": note,
+            "new_order_id": new_order_id,
+        })
+        return {"conflict_id": conflict_id, "decision": decision,
+                "new_order_id": new_order_id}
+
+    def _issue_new_version(self, old, inc, actor, at):
+        """冲突复核确认内容确需更新披露时，签发新版本保全令并固化新清单。"""
+        new_id_ = new_id("ord")
+        self._append("preservation_order_issued", {
+            "order_id": new_id_, "incident_id": inc["incident_id"],
+            "case_no": old["case_no"],
+            "version": old["version"] + 1,
+            "purpose": old["purpose"], "receiver": old["receiver"],
+            "field_scope": list(old["field_scope"]),
+            "issued_at": at, "expires_at": old["expires_at"],
+            "issued_by": actor.get("name"),
+            "basis": old["basis"], "supersedes": old["order_id"],
+        })
+        self._append("preservation_order_superseded", {
+            "order_id": old["order_id"], "superseded_by": new_id_, "at": at})
+        new_order = self.preservation_orders[new_id_]
+        self._generate_manifest(new_order, inc, at)
+        return new_id_
+
+    def _generate_manifest(self, order, inc, at):
+        items = self._build_items(inc, order["field_scope"])
+        digest = self._digest_of(order["order_id"], order["version"], items)
+        manifest_id = new_id("man")
+        self._append("manifest_generated", {
+            "manifest_id": manifest_id, "order_id": order["order_id"],
+            "incident_id": inc["incident_id"], "order_version": order["version"],
+            "generated_at": at, "digest": digest, "items": items,
+        })
+        return self.manifests[manifest_id]
+
+    def _build_items(self, inc, field_scope):
+        values = self._field_values(inc)
+        items = []
+        for code in field_scope:
+            spec = self.config.handoff_fields[code]
+            value = values.get(code)
+            items.append({
+                "field_code": code,
+                "name": spec["名称"],
+                "minimal": bool(spec["最小保全"]),
+                "included": value is not None and value != [] and value != {},
+                "value": value,
+                "item_sha256": self._sha_of(value),
+            })
+        return items
+
+    def _field_values(self, inc):
+        return {
+            "victim_code": inc["victim_code"],
+            "content_ref": [e["content_ref"] for e in inc["evidence"]],
+            "content_sha256": [e["content_sha256"] for e in inc["evidence"] if e["content_sha256"]],
+            "evidence_note": [e["note"] for e in inc["evidence"] if e.get("note")],
+            "linked_accounts": [
+                {"platform": a["platform"], "account_key": a["account_key"],
+                 "display_name": a.get("display_name")}
+                for a in inc["accounts"]],
+            "platform_receipts": [
+                {"receipt_id": r["receipt_id"], "platform": r["platform"], "status": r["status"]}
+                for r in inc["receipts"]],
+            "action_chain": [
+                {"action_id": aid, "type": self.actions[aid]["action_type"],
+                 "status": self.actions[aid]["status"]}
+                for aid in inc["actions"]],
+            "raw_contact": inc.get("raw_contact"),
+        }
+
+    def _digest_of(self, order_id, version, items):
+        canonical = json.dumps(
+            {"order_id": order_id, "version": version,
+             "items": [{"f": i["field_code"], "h": i["item_sha256"]} for i in items]},
+            ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _sha_of(self, value):
+        return hashlib.sha256(
+            json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _resolve_expiry(self, payload, purpose):
+        if payload.get("expires_at"):
+            return payload["expires_at"]
+        days = payload.get("duration_days")
+        if days is None:
+            days = self.config.default_handoff_days(purpose)
+        return (datetime.now(CST) + timedelta(days=int(days))).isoformat(timespec="seconds")
+
+    def _notify_handoff(self, incident_id, order_id, manifest_id, at):
+        """首次移交：通知交出方与接收方签认；重复移交路径不调用本方法。"""
+        for role in self.config.handoff_surrender_roles:
+            self._append("notification_sent", {
+                "notif_id": new_id("ntf"), "incident_id": incident_id,
+                "channel": "handoff", "to_role": role, "reason": "保全材料待交出方签认",
+                "order_id": order_id, "manifest_id": manifest_id, "at": at})
+        for role in self.config.handoff_receiver_roles:
+            self._append("notification_sent", {
+                "notif_id": new_id("ntf"), "incident_id": incident_id,
+                "channel": "handoff", "to_role": role, "reason": "保全材料待接收方签认",
+                "order_id": order_id, "manifest_id": manifest_id, "at": at})
+
+    # ------------------------------------------------------ 签认/拒收/退回
+    def acknowledge_manifest(self, manifest_id, actor, note=None):
+        manifest = self._get_manifest(manifest_id)
+        party = self._manifest_party(actor)
+        if manifest["status"] in ("returned",):
+            raise AppError("清单已被退回，须经补件并生成衔接清单后再签认")
+        ack = manifest["surrender_ack"] if party == "surrender" else manifest["receiver_ack"]
+        if ack:
+            raise AppError(f"{party} 方已签认，不得改写先前签认回执")
+        self._append("manifest_acknowledged", {
+            "manifest_id": manifest_id, "party": party,
+            "by": actor.get("name"), "by_role": actor["role"],
+            "at": now_iso(), "note": note,
+        })
+        return {"manifest_id": manifest_id, "party": party, "status": self.manifests[manifest_id]["status"]}
+
+    def _manifest_party(self, actor):
+        if actor["role"] in self.config.handoff_surrender_roles:
+            return "surrender"
+        if actor["role"] in self.config.handoff_receiver_roles:
+            return "receiver"
+        raise AppError(f"角色 {actor['role']} 不是保全移交的交出方或接收方", 403)
+
+    def reject_manifest_items(self, manifest_id, item_fields, reason, actor):
+        """接收方部分拒收：只追加拒收事件，原清单与已签认回执保持不变。"""
+        _require(actor, self.config.handoff_receiver_roles)
+        manifest = self._get_manifest(manifest_id)
+        valid = {i["field_code"] for i in manifest["items"]}
+        bad = [f for f in item_fields if f not in valid]
+        if bad:
+            raise AppError(f"清单不含这些字段，无法拒收：{bad}")
+        at = now_iso()
+        self._append("manifest_event_appended", {
+            "manifest_id": manifest_id, "kind": "partial_rejection",
+            "by": actor.get("name"), "by_role": actor["role"], "at": at,
+            "detail": {"item_fields": item_fields, "reason": reason},
+        })
+        return {"manifest_id": manifest_id, "status": "partial_rejection",
+                "rejected_fields": item_fields}
+
+    def return_manifest(self, manifest_id, reason, actor):
+        """接收方整批退回（来源/责任/授权期限无法确认）：只追加，不改写。"""
+        _require(actor, self.config.handoff_receiver_roles)
+        manifest = self._get_manifest(manifest_id)
+        if reason not in self.config.handoff["退回原因"]:
+            raise AppError(f"退回原因须为：{self.config.handoff['退回原因']}")
+        at = now_iso()
+        self._append("manifest_event_appended", {
+            "manifest_id": manifest_id, "kind": "returned",
+            "by": actor.get("name"), "by_role": actor["role"], "at": at,
+            "detail": {"reason": reason},
+        })
+        return {"manifest_id": manifest_id, "status": "returned", "reason": reason}
+
+    def supplement_manifest(self, manifest_id, item_fields, actor, note=None):
+        """交出方补件：补件字段必须仍在当前保全令授权范围内，否则须重新核权出新版本。"""
+        _require(actor, self.config.handoff_surrender_roles)
+        manifest = self._get_manifest(manifest_id)
+        if manifest["status"] == "returned":
+            raise AppError("清单已被整批退回，补件须由法务重新签发保全令并生成新清单", 409)
+        order = self.preservation_orders[manifest["order_id"]]
+        beyond = [f for f in item_fields if f not in order["field_scope"]]
+        if beyond:
+            raise AppError(
+                f"补件字段 {beyond} 超出原保全令披露范围，任何新增披露须重新核权并签发新版本", 409)
+        if order["status"] != "active" or self._order_expired(order):
+            raise AppError("保全令已失效或到期，补件前须由法务重新签发/延长", 409)
+        # 在字段范围内补件，只有补齐清单已封存（哈希一致）的内容才允许直接追加；
+        # 若该字段内容相对签认清单已发生变化（新增证据/新回执），属于新增披露，
+        # 必须重新核权并经冲突复核签发新版本，不能借补件扩写到旧清单。
+        inc = self.incidents[manifest["incident_id"]]
+        sealed = {i["field_code"]: i["item_sha256"] for i in manifest["items"]}
+        current = {i["field_code"]: i["item_sha256"]
+                   for i in self._build_items(inc, order["field_scope"])}
+        new_disclosure = [f for f in item_fields if current.get(f) != sealed.get(f)]
+        if new_disclosure:
+            raise AppError(
+                f"补件字段 {new_disclosure} 含清单封存之外的新增内容，"
+                "任何新增披露须重新核权并签发新版本", 409)
+        at = now_iso()
+        self._append("manifest_event_appended", {
+            "manifest_id": manifest_id, "kind": "supplemented",
+            "by": actor.get("name"), "by_role": actor["role"], "at": at,
+            "detail": {"item_fields": item_fields, "note": note,
+                       "order_version": order["version"], "order_expires_at": order["expires_at"]},
+        })
+        return {"manifest_id": manifest_id, "status": self.manifests[manifest_id]["status"],
+                "supplemented_fields": item_fields}
+
+    def extend_preservation(self, order_id, actor, reason, duration_days=None, new_expires_at=None):
+        """法务延长保全期限；司法延长标记 judicial，仅追加延长事件。"""
+        _require(actor, (self.config.handoff["签发角色"],))
+        order = self.preservation_orders.get(order_id)
+        if not order:
+            raise AppError("保全令不存在", 404)
+        judicial = "司法" in (reason or "")
+        if new_expires_at is None:
+            base = datetime.fromisoformat(order["expires_at"])
+            if duration_days is None:
+                raise AppError("延长须提供 duration_days 或 new_expires_at")
+            new_expires_at = (base + timedelta(days=int(duration_days))).isoformat(timespec="seconds")
+        previous = order["expires_at"]
+        at = now_iso()
+        self._append("preservation_extended", {
+            "order_id": order_id, "previous_expires_at": previous,
+            "new_expires_at": new_expires_at, "reason": reason,
+            "judicial": judicial, "by": actor.get("name"), "at": at,
+        })
+        return {"order_id": order_id, "expires_at": new_expires_at, "judicial": judicial}
+
+    def _get_manifest(self, manifest_id):
+        manifest = self.manifests.get(manifest_id)
+        if not manifest:
+            raise AppError("材料清单不存在", 404)
+        return manifest
+
+    def _order_expired(self, order):
+        try:
+            return datetime.fromisoformat(order["expires_at"]) < datetime.now(CST)
+        except ValueError:
+            return False
+
+    def _judicial_hold(self, inc):
+        """司法移交或已报案移交且保全令仍有效：依法留存，不受个人授权撤回影响。"""
+        if self._has_executed(inc["incident_id"], "police_report"):
+            return True
+        for order in self._orders_for(inc["incident_id"]):
+            if order["purpose"] == "judicial_transfer" and not self._order_expired(order):
+                return True
+        return False
+
+    def _orders_for(self, incident_id):
+        return [o for o in self.preservation_orders.values()
+                if o["incident_id"] == incident_id and o["status"] == "active"]
+
+    def _has_active_preservation(self, incident_id):
+        return any(not self._order_expired(o) for o in self._orders_for(incident_id))
+
     # ------------------------------------------------------------------ 查询
     def _get_incident(self, incident_id):
         inc = self.incidents.get(incident_id)
@@ -920,6 +1363,142 @@ class SafeguardingApp:
             digest["closed_at"] = inc["closed_at"]
             digest["close_reason"] = inc["close_reason"]
         return digest
+
+    def case_trace(self, incident_id, as_role=None):
+        """案件追溯：逐项说明材料为何保全、由谁保管、何时到期、缺失哪些外部回执。
+
+        普通案件查看者只能获得角色允许的脱敏内容。
+        """
+        inc = self._get_incident(incident_id)
+        masked = bool(as_role and self.config.handoff_view_is_masked(as_role))
+        received_ids = {r["receipt_id"] for r in inc["receipts"]}
+
+        orders_view = []
+        for order in self._all_orders_for(incident_id):
+            manifest = self.manifests.get(order["manifest_id"])
+            custodian = self._custodian_of(order, manifest)
+            missing = [{"receipt_id": self._mask_value("platform_receipts", e.get("receipt_id"), masked),
+                        "platform": e.get("platform")}
+                       for e in order["expected_receipts"]
+                       if e.get("receipt_id") not in received_ids]
+            orders_view.append({
+                "order_id": order["order_id"],
+                "case_no": order["case_no"],
+                "version": order["version"],
+                "purpose": self.config.handoff_purposes[order["purpose"]]["名称"],
+                "receiver": self._mask_receiver(order["receiver"], masked),
+                "status": order["status"],
+                "issued_at": order["issued_at"],
+                "issued_by": order["issued_by"],
+                "expires_at": order["expires_at"],
+                "expired": self._order_expired(order),
+                "supersedes": order.get("supersedes"),
+                "judicial_extensions": [e for e in order["extensions"] if e.get("judicial")],
+                "custodian": custodian,
+                "manifest_id": order["manifest_id"],
+                "manifest_status": manifest["status"] if manifest else None,
+                "surrender_ack": self._mask_ack(manifest, "surrender_ack", masked),
+                "receiver_ack": self._mask_ack(manifest, "receiver_ack", masked),
+                "missing_external_receipts": missing,
+                "followup_events": list(manifest["events"]) if manifest else [],
+                "items": self._trace_items(inc, order, manifest, custodian, masked),
+            })
+
+        return {
+            "incident_id": inc["incident_id"],
+            "case_no": next((o["case_no"] for o in orders_view if o["case_no"]), None),
+            "status": self._status_of(inc),
+            "masked": masked,
+            "minimal_preservation_fields": self.config.minimal_preservation_fields,
+            "judicial_hold": self._judicial_hold(inc),
+            "preservation_orders": orders_view,
+            "conflicts": [c for c in self.conflicts.values()
+                          if c["incident_id"] == incident_id],
+        }
+
+    def _trace_items(self, inc, order, manifest, custodian, masked):
+        values = self._field_values(inc)
+        items = []
+        for code in order["field_scope"]:
+            spec = self.config.handoff_fields[code]
+            minimal = bool(spec["最小保全"])
+            why = ("依法/司法存续所需最小材料，授权撤回或账号改名后仍继续留存"
+                   if minimal else f"按保全令 {order['order_id']}（{self.config.handoff_purposes[order['purpose']]['名称']}）披露范围保全")
+            value = values.get(code)
+            items.append({
+                "field_code": code,
+                "name": spec["名称"],
+                "minimal": minimal,
+                "why_preserved": why,
+                "custodian": custodian,
+                "expires_at": order["expires_at"],
+                "present": value is not None and value != [] and value != {},
+                "value": self._mask_value(code, value, masked),
+            })
+        return items
+
+    def _all_orders_for(self, incident_id):
+        return [o for o in self.preservation_orders.values()
+                if o["incident_id"] == incident_id]
+
+    def _custodian_of(self, order, manifest):
+        if manifest and manifest["receiver_ack"]:
+            org = order["receiver"].get("org_name") or order["receiver"].get("org_code")
+            return f"接收方：{org}（已签认接收）"
+        if manifest and manifest["surrender_ack"]:
+            return "交出方：俱乐部（已签认交出，待接收方签认）"
+        return "交出方：俱乐部（尚未完成签认）"
+
+    def _mask_receiver(self, receiver, masked):
+        if not masked:
+            return receiver
+        return {"org_code": self.config.handoff["脱敏查看"]["掩码"],
+                "org_name": self.config.handoff["脱敏查看"]["掩码"]}
+
+    def _mask_ack(self, manifest, key, masked):
+        if not manifest or not manifest.get(key):
+            return None
+        ack = dict(manifest[key])
+        if masked:
+            ack["by"] = self.config.handoff["脱敏查看"]["掩码"]
+        return ack
+
+    def _mask_value(self, field_code, value, masked):
+        if not masked or value is None:
+            return value
+        if self.config.handoff_mask(field_code) is None:
+            return value
+        token = self.config.handoff["脱敏查看"]["掩码"]
+        if isinstance(value, str):
+            return token
+        if isinstance(value, list):
+            return [self._mask_value(field_code, v, masked) for v in value]
+        if isinstance(value, dict):
+            return {k: self._mask_value(field_code, v, masked) for k, v in value.items()}
+        return token
+
+    def list_preservation_orders(self, incident_id=None):
+        orders = self._all_orders_for(incident_id) if incident_id \
+            else list(self.preservation_orders.values())
+        return [{
+            "order_id": o["order_id"], "incident_id": o["incident_id"],
+            "case_no": o["case_no"], "version": o["version"],
+            "purpose": o["purpose"], "receiver": o["receiver"],
+            "status": o["status"], "expires_at": o["expires_at"],
+            "manifest_id": o["manifest_id"],
+        } for o in orders]
+
+    def get_manifest(self, manifest_id, as_role=None):
+        manifest = self._get_manifest(manifest_id)
+        masked = bool(as_role and self.config.handoff_view_is_masked(as_role))
+        view = {k: v for k, v in manifest.items()}
+        if masked:
+            view["items"] = [{**i, "value": self._mask_value(i["field_code"], i["value"], True)}
+                             for i in manifest["items"]]
+        return view
+
+    def list_conflicts(self, status="open"):
+        return [c for c in self.conflicts.values() if status is None or c["status"] == status]
 
     def _action_view(self, action_id, inc):
         a = self.actions[action_id]

@@ -13,6 +13,12 @@
 - **回调幂等**：平台回调按 `callback_id` 去重，重复回调返回 `duplicate=true`，不通知、不产生第二案件、不重复挂回执；回调无法凭匿名内容另立案件。
 - **误报申诉**：申诉期间事件置"申诉中"，敏感材料仅法务复核员与值班主管可见，并阻断新的对外动作。
 - **直接威胁去重**：同一事件值班周期内重复确认威胁等级只刷新确认时间，不产生第二案件或第二次通知。
+- **材料保全移交**：法务按案件+用途签发带**版本、期限、字段范围**的保全令，系统据此固化**不可变材料清单与摘要（逐项 SHA-256 + 清单摘要）**；交出方（保护专员/法务）与接收方（外部调查机构）**分别签认**。部分拒收、整批退回、补件、司法延长均只追加衔接事件，不改写先前回执与清单。
+- **重复移交幂等**：同事件+同接收机构+同用途再次移交，不发通知、不生成第二份清单；内容一致沿用既有清单，内容变化进入**冲突复核**（保留旧版/签发新版），绝不覆盖。
+- **补件重新核权**：补件只能补齐清单已封存（哈希一致）的字段；超出字段范围或含新增内容即属新增披露，须重新核权并签发新版本。整批退回后不得在原清单补件，须重新签发。
+- **依法最小留存**：申诉、账号改名或当事人撤回非核心授权后，最小材料（当事人编号、受控引用、内容哈希）在保全令/司法存续期内继续留存，且证据留存授权不可单独撤回；到期由案件追溯标注。
+- **断点恢复**：服务中断后重放 JSONL 账本，从最后确认节点（已签发/已签认/已拒收）恢复，未确认的中间动作不补做，重复移交幂等索引依旧有效。
+- **案件追溯与脱敏**：逐项说明材料**为何保全、由谁保管、何时到期、缺失哪些外部回执**；普通案件查看者只能获得其角色允许的脱敏内容（当事人编号、引用、账号、机构等掩码）。
 
 ## 运行
 
@@ -20,7 +26,7 @@
 python3 service.py --check          # 检查配置与可重放账本
 python3 service.py --port 8000      # 内存账本（联调）
 python3 service.py --data data/events.jsonl   # 追加式持久化账本（重启可重放）
-npm test                            # 全部契约测试（27 项）
+npm test                            # 全部契约测试（43 项）
 ```
 
 ## HTTP 接口
@@ -45,15 +51,21 @@ npm test                            # 全部契约测试（27 项）
 | POST | `/suggestions/{id}` | 保护专员 accept/reject 合并建议（accept 时给 `target_incident`） |
 | POST | `/callbacks/platform` | 平台/采集回调（幂等键 `callback_id`；可携带回执、删除状态、改名信息） |
 | POST | `/incidents/{id}/close` | 关闭事件（存在未响应升级或未完成动作时拒绝） |
+| POST | `/incidents/{id}/preservation/orders` | 法务签发保全令（case_no/purpose/receiver/field_scope/期限/expected_receipts），固化不可变清单；重复移交幂等或转冲突 |
+| POST | `/manifests/{id}/ack` `/reject` `/return` `/supplement` | 交出/接收双方分别签认；部分拒收；整批退回；交出方补件（重新核权） |
+| POST | `/preservation/orders/{id}/extend` | 法务延长保全期限（reason 含"司法"标记为司法延长，只追加） |
+| POST | `/conflicts/{id}/resolve` | 重复移交内容变化的冲突复核：issue_new_version / keep_existing |
+| GET | `/incidents/{id}/trace?as_role=…` | **案件追溯**：逐项为何保全/保管方/到期/缺失外部回执；普通查看者脱敏 |
+| GET | `/manifests/{id}` `/preservation/orders` `/conflicts` | 清单、保全令、冲突复核任务查询（支持 as_role / incident_id / status 过滤） |
 
 ## 代码结构
 
-- `fixtures/domain.json` — 角色、严重度、授权范围、处置动作、值班规则、聚类/申诉规则、平台与回执样例
+- `fixtures/domain.json` — 角色、严重度、授权范围、处置动作、值班规则、聚类/申诉规则、平台与回执样例、材料保全移交（用途/字段/期限/脱敏）
 - `domain.py` — 领域配置加载与校验
 - `store.py` — 线程安全的追加式事件账本（内存或 JSONL，重放恢复）
-- `app.py` — 业务核心：受理立案、升级、证据/账号、聚类、动作复核、授权、申诉、幂等回调、统一视图
+- `app.py` — 业务核心：受理立案、升级、证据/账号、聚类、动作复核、授权、申诉、幂等回调、统一视图、保全令/材料清单/双方签认/冲突复核/案件追溯
 - `service.py` — HTTP 入口
-- `service_contract.py` / `test_safeguarding.py` — 基础契约与全链路测试
+- `service_contract.py` / `test_safeguarding.py` / `test_preservation.py` — 基础契约、处置全链路、材料保全移交全链路测试
 
 ## 运行与检查
 

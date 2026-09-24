@@ -64,6 +64,20 @@ def build_handler(app):
                     incident_id = parsed.path.split("/")[2]
                     self._send_json(200, app.incident_digest(
                         incident_id, as_role=query.get("as_role")))
+                elif parsed.path.startswith("/incidents/") and parsed.path.endswith("/trace"):
+                    incident_id = parsed.path.split("/")[2]
+                    self._send_json(200, app.case_trace(
+                        incident_id, as_role=query.get("as_role")))
+                elif parsed.path.startswith("/manifests/"):
+                    manifest_id = parsed.path.split("/")[2]
+                    self._send_json(200, app.get_manifest(
+                        manifest_id, as_role=query.get("as_role")))
+                elif parsed.path == "/preservation/orders":
+                    self._send_json(200, {"orders": app.list_preservation_orders(
+                        incident_id=query.get("incident_id"))})
+                elif parsed.path == "/conflicts":
+                    self._send_json(200, {"conflicts": app.list_conflicts(
+                        status=query.get("status", "open"))})
                 elif parsed.path == "/suggestions":
                     self._send_json(200, {"suggestions": app.list_suggestions(
                         status=query.get("status", "open"))})
@@ -136,6 +150,10 @@ def build_handler(app):
                     elif rest == ["close"]:
                         app.close_incident(incident_id, body.get("reason"), actor)
                         result = {"status": "已关闭"}
+                    elif rest == ["preservation", "orders"]:
+                        result = app.issue_preservation_order(incident_id, body, actor)
+                        self._send_json(201, result)
+                        return
                     else:
                         self._send_json(404, {"error": "事件子路由不存在", "path": path})
                         return
@@ -159,6 +177,44 @@ def build_handler(app):
                     result = app.resolve_suggestion(
                         parts[1], body.get("decision"), actor,
                         target_incident=body.get("target_incident"))
+                    self._send_json(200, result)
+
+                elif len(parts) >= 3 and parts[0] == "manifests":
+                    manifest_id = parts[1]
+                    actor = self._actor(body)
+                    action = parts[2]
+                    if action == "ack":
+                        result = app.acknowledge_manifest(
+                            manifest_id, actor, note=body.get("note"))
+                    elif action == "reject":
+                        result = app.reject_manifest_items(
+                            manifest_id, body.get("item_fields", []),
+                            body.get("reason"), actor)
+                    elif action == "return":
+                        result = app.return_manifest(
+                            manifest_id, body.get("reason"), actor)
+                    elif action == "supplement":
+                        result = app.supplement_manifest(
+                            manifest_id, body.get("item_fields", []), actor,
+                            note=body.get("note"))
+                    else:
+                        self._send_json(404, {"error": "清单子路由不存在", "path": path})
+                        return
+                    self._send_json(200, result)
+
+                elif len(parts) == 4 and parts[:2] == ["preservation", "orders"] \
+                        and parts[3] == "extend":
+                    actor = self._actor(body)
+                    result = app.extend_preservation(
+                        parts[2], actor, body.get("reason"),
+                        duration_days=body.get("duration_days"),
+                        new_expires_at=body.get("new_expires_at"))
+                    self._send_json(200, result)
+
+                elif len(parts) == 3 and parts[0] == "conflicts" and parts[2] == "resolve":
+                    actor = self._actor(body)
+                    result = app.resolve_handoff_conflict(
+                        parts[1], body.get("decision"), actor, note=body.get("note"))
                     self._send_json(200, result)
 
                 else:

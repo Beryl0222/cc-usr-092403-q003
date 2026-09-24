@@ -28,6 +28,9 @@ class DomainConfig:
         self.clustering = data["聚类"]
         self.consent_rules = data["授权规则"]
         self.separation = data["职责分离"]
+        self.handoff = data["材料保全移交"]
+        self.handoff_purposes = {item["编码"]: item for item in self.handoff["保全用途"]}
+        self.handoff_fields = {item["编码"]: item for item in self.handoff["材料字段"]}
         self._validate()
 
     def _validate(self):
@@ -47,6 +50,25 @@ class DomainConfig:
         for role in self.duty["通知角色"]:
             if role not in self.roles:
                 raise DomainError(f"值班通知角色未登记: {role}")
+        # 材料保全移交配置校验
+        if self.handoff["签发角色"] not in self.roles:
+            raise DomainError(f"保全令签发角色未登记: {self.handoff['签发角色']}")
+        for role in self.handoff["交出角色"] + self.handoff["接收角色"]:
+            if role not in self.roles:
+                raise DomainError(f"保全移交角色未登记: {role}")
+        if not self.handoff_purposes:
+            raise DomainError("保全用途未配置")
+        minimal = set(self.handoff["最小保全字段"])
+        configured = set(self.handoff_fields)
+        missing = minimal - configured
+        if missing:
+            raise DomainError(f"最小保全字段未在材料字段中登记: {sorted(missing)}")
+        mask_role = self.handoff["脱敏查看"]["角色"]
+        if mask_role not in self.roles:
+            raise DomainError(f"脱敏查看角色未登记: {mask_role}")
+        unknown_mask = set(self.handoff["脱敏查看"]["脱敏字段"]) - configured
+        if unknown_mask:
+            raise DomainError(f"脱敏字段未登记: {sorted(unknown_mask)}")
 
     @property
     def default_scopes(self):
@@ -80,6 +102,37 @@ class DomainConfig:
 
     def appeal_can_view_sensitive(self, role):
         return role in self.appeal["可见角色例外"]
+
+    # ------------------------------------------------------ 材料保全移交
+    def is_valid_handoff_purpose(self, code):
+        return code in self.handoff_purposes
+
+    def default_handoff_days(self, purpose):
+        return self.handoff["默认期限天"].get(purpose)
+
+    @property
+    def minimal_preservation_fields(self):
+        return list(self.handoff["最小保全字段"])
+
+    def is_configured_handoff_field(self, code):
+        return code in self.handoff_fields
+
+    @property
+    def handoff_surrender_roles(self):
+        return tuple(self.handoff["交出角色"])
+
+    @property
+    def handoff_receiver_roles(self):
+        return tuple(self.handoff["接收角色"])
+
+    def handoff_view_is_masked(self, role):
+        """普通案件查看者只能看到脱敏内容；其余登记角色按各自既有视图。"""
+        return role == self.handoff["脱敏查看"]["角色"]
+
+    def handoff_mask(self, field_code):
+        mask = self.handoff["脱敏查看"]["掩码"]
+        masked = set(self.handoff["脱敏查看"]["脱敏字段"])
+        return mask if field_code in masked else None
 
 
 def load_config(path=FIXTURE_PATH):
