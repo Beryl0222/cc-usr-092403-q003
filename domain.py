@@ -28,17 +28,20 @@ class DomainConfig:
         self.clustering = data["聚类"]
         self.consent_rules = data["授权规则"]
         self.separation = data["职责分离"]
+        self.handoff = data["外部移交保全"]
         self._validate()
 
     def _validate(self):
-        required_roles = {"当事人代理", "俱乐部保护专员", "俱乐部值班主管", "平台联络员", "法务复核员"}
+        required_roles = {"当事人代理", "俱乐部保护专员", "俱乐部值班主管",
+                          "平台联络员", "法务复核员", "外部调查机构", "普通案件查看者"}
         missing_roles = required_roles - self.roles
         if missing_roles:
             raise DomainError(f"领域配置缺少角色: {sorted(missing_roles)}")
         for code in ("criticism", "abuse", "direct_threat"):
             if code not in self.severities:
                 raise DomainError(f"领域配置缺少严重度: {code}")
-        for code in ("report", "evidence_storage", "platform_complaint", "police_report", "public_statement"):
+        for code in ("report", "evidence_storage", "platform_complaint",
+                     "police_report", "public_statement", "external_disclosure"):
             if code not in self.scopes:
                 raise DomainError(f"领域配置缺少授权范围: {code}")
         for action_type, item in self.actions.items():
@@ -47,6 +50,12 @@ class DomainConfig:
         for role in self.duty["通知角色"]:
             if role not in self.roles:
                 raise DomainError(f"值班通知角色未登记: {role}")
+        handoff = self.handoff
+        if handoff["交出方角色"] not in self.roles or handoff["接收方角色"] not in self.roles:
+            raise DomainError("移交交出/接收角色未登记")
+        for group, fields in handoff["字段分组"].items():
+            if not fields:
+                raise DomainError(f"移交字段分组 {group} 为空")
 
     @property
     def default_scopes(self):
@@ -80,6 +89,49 @@ class DomainConfig:
 
     def appeal_can_view_sensitive(self, role):
         return role in self.appeal["可见角色例外"]
+
+    # ------------------------------------------------------------ 外部移交保全
+    @property
+    def handoff_purposes(self):
+        return list(self.handoff["移交用途"])
+
+    @property
+    def handoff_return_reasons(self):
+        return list(self.handoff["退回原因"])
+
+    @property
+    def handoff_field_groups(self):
+        return self.handoff["字段分组"]
+
+    @property
+    def default_field_scope(self):
+        return list(self.handoff["默认字段范围"])
+
+    def purpose_name(self, purpose):
+        return self.handoff["用途名称"].get(purpose, purpose)
+
+    def return_reason_name(self, reason):
+        return self.handoff["退回原因名称"].get(reason, reason)
+
+    def fields_for_groups(self, groups):
+        """把字段分组展开为去重后的扁平字段列表，保持分组声明顺序。"""
+        fields = []
+        for group in groups:
+            for field in self.handoff_field_groups.get(group, []):
+                if field not in fields:
+                    fields.append(field)
+        return fields
+
+    def handoff_can_view_unmasked(self, role):
+        return role in self.handoff["普通查看脱敏"]["可见角色例外"]
+
+    @property
+    def handoff_mask_fields(self):
+        return list(self.handoff["普通查看脱敏"]["脱敏字段"])
+
+    @property
+    def handoff_mask_placeholder(self):
+        return self.handoff["普通查看脱敏"]["脱敏占位"]
 
 
 def load_config(path=FIXTURE_PATH):

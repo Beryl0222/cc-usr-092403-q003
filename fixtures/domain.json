@@ -5,7 +5,9 @@
     "俱乐部保护专员",
     "俱乐部值班主管",
     "平台联络员",
-    "法务复核员"
+    "法务复核员",
+    "外部调查机构",
+    "普通案件查看者"
   ],
   "参考状态": [
     "已受理",
@@ -63,6 +65,11 @@
       "编码": "evidence_storage",
       "名称": "证据留存",
       "说明": "允许继续留存本案受控证据引用与内容哈希"
+    },
+    {
+      "编码": "external_disclosure",
+      "名称": "对外移交披露",
+      "说明": "允许按法务保全令向外部调查机构移交材料；非核心授权，撤回后已依法保全的最小材料继续留存，但任何新增披露须重新核权"
     }
   ],
   "授权规则": {
@@ -148,8 +155,42 @@
     "敏感脱敏": ["content_ref", "raw_excerpt", "linked_accounts"],
     "可见角色例外": ["法务复核员", "俱乐部值班主管"]
   },
+  "外部移交保全": {
+    "说明": "法务按案件和用途签发带版本、期限与字段范围的保全令；系统据此生成不可变材料清单与摘要，交出方（俱乐部）与接收方（外部调查机构）分别签认。拒收、退回、补件、司法延长均只追加后续事件，不改写先前回执；重复移交不重复通知、不另生清单，内容变化进入冲突复核。",
+    "保全令签发角色": ["法务复核员"],
+    "交出方角色": "俱乐部保护专员",
+    "接收方角色": "外部调查机构",
+    "移交用途": ["police_investigation", "external_investigation", "judicial_extension"],
+    "用途名称": {
+      "police_investigation": "司法侦查",
+      "external_investigation": "外部机构调查",
+      "judicial_extension": "司法程序延长留存"
+    },
+    "字段分组": {
+      "evidence": ["content_ref", "content_sha256", "state", "kind", "submitted_by", "at", "note"],
+      "account": ["platform", "account_key", "url", "display_name"],
+      "receipt": ["receipt_id", "platform", "status", "reported_at"],
+      "case": ["incident_id", "severity", "victim_code", "opened_at"]
+    },
+    "默认字段范围": ["evidence", "account", "receipt", "case"],
+    "退回原因": ["source_unconfirmed", "custodian_unclear", "authorization_expired", "scope_mismatch"],
+    "退回原因名称": {
+      "source_unconfirmed": "来源无法确认",
+      "custodian_unclear": "交出责任不清",
+      "authorization_expired": "授权期限缺失或已过",
+      "scope_mismatch": "材料超出披露字段范围"
+    },
+    "非核心授权": ["external_disclosure", "platform_complaint", "public_statement"],
+    "最小保全字段": ["incident_id", "content_ref", "content_sha256", "retention_until", "preservation_order_id"],
+    "普通查看脱敏": {
+      "说明": "普通案件查看者只能获得角色允许的脱敏内容：不暴露受控引用原文、账号键、URL、当事人码与外部签认人",
+      "可见角色例外": ["法务复核员", "俱乐部值班主管", "俱乐部保护专员"],
+      "脱敏字段": ["content_ref", "content_url", "account_key", "url", "victim_code", "display_name", "receiver_contact", "handover_to"],
+      "脱敏占位": "【无权查看】"
+    }
+  },
   "责任链": {
-    "说明": "内容删除、账号改名、证据补充、授权撤回均只追加变更记录，不覆盖、不删除既有证据与决定；任意时刻可还原事件全过程"
+    "说明": "内容删除、账号改名、证据补充、授权撤回、移交退回与补件均只追加变更记录，不覆盖、不删除既有证据、清单与回执；任意时刻可还原事件全过程"
   },
   "平台回执样例": [
     {

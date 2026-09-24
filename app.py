@@ -10,6 +10,7 @@
 """
 
 import hashlib
+import json
 from datetime import datetime, timezone, timedelta
 
 from domain import load_config
@@ -66,7 +67,13 @@ class SafeguardingApp:
         self.suggestions = {}        # suggestion_id -> 合并建议
         self.callbacks = {}          # callback_id -> 首次处理结果
         self.notifications = []      # 通知外发箱（抽象渠道）
+        self.orders = {}             # preservation_order_id -> 保全令投影
+        self.manifests = {}          # manifest_id -> 不可变材料清单快照
+        self.handoffs = {}           # handoff_id -> 外部移交投影
+        self.conflicts = {}          # conflict_id -> 移交冲突复核
+        self._handoff_keys = {}      # (order_id, receiver_org, purpose) -> handoff_id
         self._suggestion_keys = set()
+        self._last_seq = 0
         self._replay()
         self.store.subscribe(self._apply)
 
@@ -80,6 +87,7 @@ class SafeguardingApp:
         return event
 
     def _apply(self, event):
+        self._last_seq = event["seq"]
         handler = getattr(self, f"_on_{event['type']}", None)
         if handler:
             handler(event["payload"])
@@ -241,6 +249,8 @@ class SafeguardingApp:
             "merged_into": None,
             "absorbed": [],
             "false_report_upheld": False,
+            "preservation_orders": [],
+            "handoffs": [],
         }
         report = self.reports.get(p["report_no"])
         if report is not None and report.get("incident_id") is None:
@@ -426,6 +436,155 @@ class SafeguardingApp:
     def _on_callback_processed(self, p):
         if p["callback_id"] not in self.callbacks:
             self.callbacks[p["callback_id"]] = p["result"]
+
+    # ------------------------------------------------------- 保全令/清单/移交
+    def _on_preservation_order_issued(self, p):
+        self.orders[p["order_id"]] = {
+            "order_id": p["order_id"], "incident_id": p["incident_id"],
+            "version": p["version"], "supersedes": p.get("supersedes"),
+            "purpose": p["purpose"], "field_groups": list(p["field_groups"]),
+            "fields": list(p["fields"]),
+            "issued_by": p["issued_by"], "issued_at": p["at"],
+            "valid_from": p["valid_from"], "valid_until": p["valid_until"],
+            "status": "active",
+            "superseded_by": None,
+            "extensions": [],
+            "manifest_ids": [],
+        }
+        inc = self.incidents.get(p["incident_id"])
+        if inc and p["order_id"] not in inc["preservation_orders"]:
+            inc["preservation_orders"].append(p["order_id"])
+        prev = p.get("supersedes")
+        if prev and prev in self.orders:
+            self.orders[prev]["status"] = "superseded"
+            self.orders[prev]["superseded_by"] = p["order_id"]
+
+    def _on_preservation_extended(self, p):
+        order = self.orders.get(p["order_id"])
+        if order:
+            order["valid_until"] = p["new_valid_until"]
+            order["extensions"].append({
+                "extension_id": p["extension_id"], "kind": p["kind"],
+                "reason": p["reason"], "granted_by": p["by"],
+                "at": p["at"], "new_valid_until": p["new_valid_until"],
+                "legal_ref": p.get("legal_ref"),
+            })
+
+    def _on_manifest_generated(self, p):
+        self.manifests[p["manifest_id"]] = {
+            "manifest_id": p["manifest_id"], "order_id": p["order_id"],
+            "order_version": p["order_version"], "incident_id": p["incident_id"],
+            "purpose": p["purpose"], "fields": list(p["fields"]),
+            "generated_at": p["at"],
+            "items": list(p["items"]),
+            "summary": dict(p["summary"]),
+            "manifest_sha256": p["manifest_sha256"],
+        }
+        order = self.orders.get(p["order_id"])
+        if order and p["manifest_id"] not in order["manifest_ids"]:
+            order["manifest_ids"].append(p["manifest_id"])
+
+    def _on_handoff_created(self, p):
+        self.handoffs[p["handoff_id"]] = {
+            "handoff_id": p["handoff_id"], "incident_id": p["incident_id"],
+            "order_id": p["order_id"], "manifest_id": p["manifest_id"],
+            "purpose": p["purpose"],
+            "receiver_org": p["receiver_org"], "receiver_contact": p.get("receiver_contact"),
+            "handover_by": p["handover_by"], "created_at": p["at"],
+            "state": "pending_surrender",
+            "surrender_ack": None,
+            "receiver_ack": None,
+            "rejection": None,
+            "returned": None,
+            "supplement_of": p.get("supplement_of"),
+            "last_event_seq": self._last_seq,
+            "conflict_accepted": False,
+            "events": [{"type": "handoff_created", "at": p["at"]}],
+        }
+        inc = self.incidents.get(p["incident_id"])
+        if inc and p["handoff_id"] not in inc["handoffs"]:
+            inc["handoffs"].append(p["handoff_id"])
+        if not p.get("supplement_of"):
+            self._handoff_keys[(p["order_id"], p["receiver_org"], p["purpose"])] = p["handoff_id"]
+
+    def _touch_handoff(self, p, state=None, event_type=None):
+        h = self.handoffs.get(p["handoff_id"])
+        if not h:
+            return
+        if state:
+            h["state"] = state
+        h["last_event_seq"] = self._last_seq
+        if event_type:
+            h["events"].append({"type": event_type, "at": p["at"]})
+
+    def _on_handoff_surrender_acknowledged(self, p):
+        h = self.handoffs.get(p["handoff_id"])
+        if h:
+            h["surrender_ack"] = {"by": p["by"], "role": p["role"], "at": p["at"]}
+            self._touch_handoff(p, state="pending_receiver",
+                                event_type="surrender_acknowledged")
+
+    def _on_handoff_receiver_acknowledged(self, p):
+        h = self.handoffs.get(p["handoff_id"])
+        if h:
+            h["receiver_ack"] = {"by": p["by"], "at": p["at"], "note": p.get("note")}
+            self._touch_handoff(p, state="acknowledged",
+                                event_type="receiver_acknowledged")
+
+    def _on_handoff_rejected(self, p):
+        h = self.handoffs.get(p["handoff_id"])
+        if h:
+            h["rejection"] = {"reason": p["reason"], "detail": p.get("detail"),
+                              "items": p.get("items", []),
+                              "by": p["by"], "at": p["at"]}
+            self._touch_handoff(p, state="rejected", event_type="rejected")
+
+    def _on_handoff_returned(self, p):
+        h = self.handoffs.get(p["handoff_id"])
+        if h:
+            h["returned"] = {"reason": p["reason"], "detail": p.get("detail"),
+                             "items": p.get("items", []),
+                             "by": p["by"], "at": p["at"]}
+            self._touch_handoff(p, state="returned", event_type="returned")
+
+    def _on_handoff_supplemented(self, p):
+        h = self.handoffs.get(p["handoff_id"])
+        if h:
+            h["manifest_id"] = p["manifest_id"]
+            h["state"] = "pending_receiver"
+            h["conflict_accepted"] = False
+            self._touch_handoff(p, state="pending_receiver",
+                                event_type="supplemented")
+
+    def _on_handoff_conflict_raised(self, p):
+        h = self.handoffs.get(p["handoff_id"])
+        self.conflicts[p["conflict_id"]] = {
+            "conflict_id": p["conflict_id"], "handoff_id": p["handoff_id"],
+            "incident_id": p["incident_id"], "differences": list(p["differences"]),
+            "detected_at": p["at"], "status": "open",
+            "resolved_by": None, "resolved_at": None, "decision": None,
+        }
+        if h:
+            self._touch_handoff(p, state="conflict_review",
+                                event_type="conflict_raised")
+
+    def _on_handoff_conflict_resolved(self, p):
+        conflict = self.conflicts.get(p["conflict_id"])
+        if conflict:
+            conflict["status"] = "resolved"
+            conflict["decision"] = p["decision"]
+            conflict["resolved_by"] = p["by"]
+            conflict["resolved_at"] = p["at"]
+            conflict["note"] = p.get("note")
+        h = self.handoffs.get(p["handoff_id"])
+        if h:
+            if p["decision"] == "accept_existing":
+                # 复核维持原清单：差异已裁断，重复移交按幂等处理，不再重复开冲突
+                h["state"] = "acknowledged"
+                h["conflict_accepted"] = True
+            else:
+                h["state"] = "supplement_required"
+            h["events"].append({"type": "conflict_resolved", "at": p["at"]})
 
     # ------------------------------------------------------------- 严重度确认
     def confirm_severity(self, incident_id, severity, actor):
@@ -829,6 +988,552 @@ class SafeguardingApp:
             return None
         return next((e for e in incident["evidence"] if e["content_ref"] == url), None)
 
+    # ============================================================ 保全令/外部移交
+    DISCLOSURE_SCOPE = "external_disclosure"
+
+    def _parse_iso(self, value):
+        try:
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            raise AppError(f"时间格式不合法（需 ISO-8601）：{value}")
+
+    def _assert_not_merged(self, inc):
+        if inc.get("merged_into"):
+            raise AppError(f"该事件已合并入 {inc['merged_into']}，请在主事件上操作", 409)
+
+    def _order(self, order_id):
+        order = self.orders.get(order_id)
+        if not order:
+            raise AppError("保全令不存在", 404)
+        return order
+
+    def _handoff(self, handoff_id):
+        handoff = self.handoffs.get(handoff_id)
+        if not handoff:
+            raise AppError("移交记录不存在", 404)
+        return handoff
+
+    def _assert_disclosure_authorized(self, inc):
+        """新增对外披露必须当前持有 external_disclosure 授权（撤回后须重新核权）。"""
+        if self.DISCLOSURE_SCOPE not in inc["consent_scopes"]:
+            raise AppError("当事人对外移交披露授权不足或已撤回，新增披露须重新核权后再进行", 409)
+
+    def _assert_disclosure_open(self, inc):
+        if inc["appeal"] and inc["appeal"]["status"] == "open":
+            raise AppError("误报申诉期间不得对外移交新材料", 409)
+
+    # ------------------------------------------------------------- 保全令签发
+    def issue_preservation_order(self, incident_id, payload, actor):
+        """法务按案件+用途签发带版本、期限、字段范围的保全令，并生成不可变清单。"""
+        _require(actor, tuple(self.config.handoff["保全令签发角色"]))
+        inc = self._get_incident(incident_id)
+        self._assert_not_merged(inc)
+
+        purpose = payload.get("purpose")
+        if purpose not in self.config.handoff_purposes:
+            raise AppError(f"未知移交用途：{purpose}")
+        groups = payload.get("field_groups") or self.config.default_field_scope
+        unknown_groups = set(groups) - set(self.config.handoff_field_groups)
+        if unknown_groups:
+            raise AppError(f"未知字段范围分组：{sorted(unknown_groups)}")
+        fields = self.config.fields_for_groups(groups)
+
+        valid_from = payload.get("valid_from") or now_iso()
+        valid_until = payload.get("valid_until")
+        if not valid_until:
+            raise AppError("保全令必须载明授权期限 valid_until")
+        if self._parse_iso(valid_until) <= self._parse_iso(valid_from):
+            raise AppError("保全令到期日必须晚于生效日")
+
+        supersedes = payload.get("supersedes")
+        active_same_purpose = [oid for oid, o in self.orders.items()
+                               if o["incident_id"] == incident_id and o["purpose"] == purpose
+                               and o["status"] == "active"]
+        if supersedes:
+            old = self._order(supersedes)
+            if old["incident_id"] != incident_id or old["purpose"] != purpose:
+                raise AppError("被替换的保全令必须属于同一案件与同一用途")
+            active_same_purpose = [oid for oid in active_same_purpose if oid != supersedes]
+        if active_same_purpose:
+            raise AppError(
+                f"该案件用途已存在生效保全令 {active_same_purpose[0]}，变更须显式 supersedes 换版", 409)
+        version = self._next_version(supersedes)
+
+        order_id = new_id("po")
+        at = now_iso()
+        self._append("preservation_order_issued", {
+            "order_id": order_id, "incident_id": incident_id,
+            "version": version, "supersedes": supersedes,
+            "purpose": purpose, "field_groups": groups, "fields": fields,
+            "valid_from": valid_from, "valid_until": valid_until,
+            "issued_by": actor.get("name"), "at": at,
+        })
+        manifest = self._generate_manifest(order_id)
+        return {"order_id": order_id, "version": version, "supersedes": supersedes,
+                "purpose": purpose, "purpose_name": self.config.purpose_name(purpose),
+                "valid_from": valid_from, "valid_until": valid_until,
+                "field_groups": groups, "fields": fields,
+                "manifest_id": manifest["manifest_id"],
+                "manifest_sha256": manifest["manifest_sha256"]}
+
+    def _next_version(self, supersedes):
+        if not supersedes:
+            return "v1"
+        old_version = self._order(supersedes)["version"]
+        try:
+            return f"v{int(old_version.lstrip('v')) + 1}"
+        except ValueError:
+            return f"{old_version}.1"
+
+    def extend_preservation_order(self, order_id, payload, actor):
+        """司法延长：只追加延长期限事件，保全令本体与既有清单不变。"""
+        _require(actor, tuple(self.config.handoff["保全令签发角色"]))
+        order = self._order(order_id)
+        if order["status"] != "active":
+            raise AppError("仅生效中的保全令可以延期")
+        new_until = payload.get("new_valid_until")
+        if not new_until:
+            raise AppError("延期必须提供 new_valid_until")
+        if self._parse_iso(new_until) <= self._parse_iso(order["valid_until"]):
+            raise AppError("延期后的到期日必须晚于当前到期日")
+        kind = payload.get("kind", "judicial_extension")
+        if kind == "judicial_extension" and not payload.get("legal_ref"):
+            raise AppError("司法延长必须附法律文书编号 legal_ref")
+        extension_id = new_id("ext")
+        self._append("preservation_extended", {
+            "extension_id": extension_id, "order_id": order_id, "kind": kind,
+            "reason": payload.get("reason", "司法程序需要，延长保全期限"),
+            "legal_ref": payload.get("legal_ref"),
+            "new_valid_until": new_until, "by": actor.get("name"), "at": now_iso(),
+        })
+        return {"order_id": order_id, "extension_id": extension_id,
+                "valid_until": new_until}
+
+    # ------------------------------------------------------------- 不可变清单
+    def _generate_manifest(self, order_id, supersedes_manifest=None):
+        order = self._order(order_id)
+        inc = self.incidents[order["incident_id"]]
+        items = self._manifest_items(inc, set(order["fields"]))
+        summary = self._manifest_summary(inc, items, order)
+        canonical = json.dumps(
+            {"order_id": order_id, "version": order["version"],
+             "purpose": order["purpose"], "items": items},
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        manifest_id = new_id("man")
+        at = now_iso()
+        self._append("manifest_generated", {
+            "manifest_id": manifest_id, "order_id": order_id,
+            "order_version": order["version"], "incident_id": inc["incident_id"],
+            "purpose": order["purpose"], "fields": order["fields"],
+            "items": items, "summary": summary,
+            "manifest_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "supersedes_manifest": supersedes_manifest, "at": at,
+        })
+        return self.manifests[manifest_id]
+
+    def _manifest_items(self, inc, field_set):
+        groups = self.config.handoff_field_groups
+        group_active = {group: bool(set(fields) & field_set)
+                        for group, fields in groups.items()}
+        items = []
+        if group_active["evidence"]:
+            for e in inc["evidence"]:
+                data = {k: e.get(k) for k in groups["evidence"] if k in field_set}
+                if data:
+                    items.append({"category": "evidence", "item_id": e["evidence_id"], "data": data})
+        if group_active["account"]:
+            for a in inc["accounts"]:
+                data = {k: a.get(k) for k in groups["account"] if k in field_set}
+                if data:
+                    items.append({"category": "account", "item_id": a["link_id"], "data": data})
+        if group_active["receipt"]:
+            for r in inc["receipts"]:
+                data = {k: r.get(k) for k in groups["receipt"] if k in field_set}
+                if data:
+                    items.append({"category": "receipt", "item_id": r["receipt_id"], "data": data})
+        if group_active["case"]:
+            case_values = {"incident_id": inc["incident_id"], "severity": inc["severity"],
+                           "victim_code": inc["victim_code"], "opened_at": inc["opened_at"]}
+            data = {k: case_values.get(k) for k in groups["case"] if k in field_set}
+            if data:
+                items.append({"category": "case", "item_id": inc["incident_id"], "data": data})
+        return items
+
+    def _manifest_summary(self, inc, items, order):
+        counts = {"evidence": 0, "account": 0, "receipt": 0, "case": 0}
+        evidence_hashes = []
+        for item in items:
+            counts[item["category"]] += 1
+            if item["category"] == "evidence" and item["data"].get("content_sha256"):
+                evidence_hashes.append(item["data"]["content_sha256"])
+        return {"purpose": order["purpose"],
+                "purpose_name": self.config.purpose_name(order["purpose"]),
+                "material_counts": counts,
+                "evidence_sha256": sorted(evidence_hashes),
+                "retention_until": order["valid_until"],
+                "custodian": self.config.handoff["交出方角色"],
+                "fields": order["fields"]}
+
+    def _manifest_diff(self, handoff):
+        """对比移交时清单与案件当前材料（同一保全令字段范围），返回逐项差异。"""
+        manifest = self.manifests[handoff["manifest_id"]]
+        current = self._manifest_items(self.incidents[handoff["incident_id"]],
+                                       set(manifest["fields"]))
+        def norm(items):
+            return {f"{i['category']}|{i['item_id']}": i["data"] for i in items}
+        old, now = norm(manifest["items"]), norm(current)
+        diffs = []
+        for key in sorted(set(old) | set(now)):
+            if key not in old:
+                diffs.append({"item": key, "change": "added", "current": now[key]})
+            elif key not in now:
+                diffs.append({"item": key, "change": "removed", "previous": old[key]})
+            elif old[key] != now[key]:
+                diffs.append({"item": key, "change": "changed",
+                              "previous": old[key], "current": now[key]})
+        return diffs
+
+    # ------------------------------------------------------------------ 移交
+    def create_handoff(self, incident_id, payload, actor):
+        """交出方按保全向外部机构移交；同（保全令+机构+用途）重复移交幂等。"""
+        _require(actor, (self.config.handoff["交出方角色"],))
+        inc = self._get_incident(incident_id)
+        self._assert_not_merged(inc)
+        order = self._order(payload.get("order_id"))
+        if order["incident_id"] != incident_id:
+            raise AppError("保全令不属于该事件")
+        if order["status"] != "active":
+            raise AppError("保全令未生效或已换版，不能据此移交")
+        if self._parse_iso(order["valid_until"]) <= self._parse_iso(now_iso()):
+            raise AppError("保全令授权期限已过，须经司法延期或重新签发后再移交", 409)
+        receiver_org = payload.get("receiver_org")
+        if not receiver_org:
+            raise AppError("必须载明接收机构 receiver_org（来源与交出责任须可确认）")
+        purpose = payload.get("purpose") or order["purpose"]
+        if purpose != order["purpose"]:
+            raise AppError("移交用途必须与保全令用途一致")
+
+        self._assert_disclosure_open(inc)
+
+        key = (order["order_id"], receiver_org, purpose)
+        existing_id = self._handoff_keys.get(key)
+        if existing_id:
+            return self._handle_duplicate_handoff(self.handoffs[existing_id], key)
+
+        self._assert_disclosure_authorized(inc)
+        handoff_id = new_id("hd")
+        at = now_iso()
+        self._append("handoff_created", {
+            "handoff_id": handoff_id, "incident_id": incident_id,
+            "order_id": order["order_id"], "manifest_id": order["manifest_ids"][-1],
+            "purpose": purpose, "receiver_org": receiver_org,
+            "receiver_contact": payload.get("receiver_contact"),
+            "handover_by": actor.get("name"), "at": at,
+        })
+        # 首次移交通知接收方；重复移交路径不会再发通知
+        self._append("notification_sent", {
+            "notif_id": new_id("ntf"), "incident_id": incident_id,
+            "channel": "external_handoff", "to_role": self.config.handoff["接收方角色"],
+            "reason": f"材料移交待接收签认：{self.config.purpose_name(purpose)}",
+            "handoff_id": handoff_id, "at": at,
+        })
+        return {"duplicate": False, "handoff_id": handoff_id,
+                "state": "pending_surrender", "manifest_id": order["manifest_ids"][-1]}
+
+    def _handle_duplicate_handoff(self, handoff, key):
+        """重复移交：不发通知、不生第二份清单；内容有变则开冲突复核。"""
+        diffs = self._manifest_diff(handoff)
+        if not diffs or handoff.get("conflict_accepted"):
+            # 无差异，或差异已被复核裁定维持原清单：按幂等返回，不再重复开冲突/通知
+            return {"duplicate": True, "handoff_id": handoff["handoff_id"],
+                    "state": handoff["state"], "content_changed": False}
+        open_conflict = next((c for c in self.conflicts.values()
+                              if c["handoff_id"] == handoff["handoff_id"]
+                              and c["status"] == "open"), None)
+        if open_conflict:
+            return {"duplicate": True, "handoff_id": handoff["handoff_id"],
+                    "state": "conflict_review", "content_changed": True,
+                    "conflict_id": open_conflict["conflict_id"]}
+        conflict_id = new_id("cfl")
+        self._append("handoff_conflict_raised", {
+            "conflict_id": conflict_id, "handoff_id": handoff["handoff_id"],
+            "incident_id": handoff["incident_id"], "differences": diffs,
+            "duplicate_key": list(key), "at": now_iso(),
+        })
+        return {"duplicate": True, "handoff_id": handoff["handoff_id"],
+                "state": "conflict_review", "content_changed": True,
+                "conflict_id": conflict_id}
+
+    def acknowledge_surrender(self, handoff_id, actor):
+        """交出方签认：确认材料已按清单交出。"""
+        _require(actor, (self.config.handoff["交出方角色"],))
+        handoff = self._handoff(handoff_id)
+        if handoff["state"] != "pending_surrender":
+            raise AppError(f"当前状态 {handoff['state']} 不能再作出交出签认")
+        self._append("handoff_surrender_acknowledged", {
+            "handoff_id": handoff_id, "by": actor.get("name"),
+            "role": actor["role"], "at": now_iso(),
+        })
+        return {"handoff_id": handoff_id, "state": "pending_receiver"}
+
+    def acknowledge_handoff(self, handoff_id, actor, note=None):
+        """接收方签认：确认收到且来源、责任、授权期限可确认。"""
+        _require(actor, (self.config.handoff["接收方角色"],))
+        handoff = self._handoff(handoff_id)
+        if handoff["state"] not in ("pending_receiver",):
+            raise AppError(f"当前状态 {handoff['state']} 不能作出接收签认")
+        self._append("handoff_receiver_acknowledged", {
+            "handoff_id": handoff_id, "by": actor.get("name"),
+            "note": note, "at": now_iso(),
+        })
+        return {"handoff_id": handoff_id, "state": "acknowledged"}
+
+    def reject_handoff(self, handoff_id, payload, actor):
+        """接收方拒收：尚未接管材料即拒绝，只追加拒收事件。"""
+        _require(actor, (self.config.handoff["接收方角色"],))
+        handoff = self._handoff(handoff_id)
+        if handoff["state"] != "pending_receiver":
+            raise AppError(f"当前状态 {handoff['state']} 不能拒收")
+        reason = self._validate_return_reason(payload)
+        self._append("handoff_rejected", {
+            "handoff_id": handoff_id, "reason": reason,
+            "reason_name": self.config.return_reason_name(reason),
+            "detail": payload.get("detail"), "items": payload.get("items", []),
+            "partial": bool(payload.get("items")),
+            "by": actor.get("name"), "at": now_iso(),
+        })
+        return {"handoff_id": handoff_id, "state": "rejected"}
+
+    def return_handoff(self, handoff_id, payload, actor):
+        """接收方接管后退回附件：不改写任何先前签认/回执，只追加退回事件。"""
+        _require(actor, (self.config.handoff["接收方角色"],))
+        handoff = self._handoff(handoff_id)
+        if handoff["state"] != "acknowledged":
+            raise AppError(f"当前状态 {handoff['state']} 不能退回（仅已签认接收的可退回）")
+        reason = self._validate_return_reason(payload)
+        self._append("handoff_returned", {
+            "handoff_id": handoff_id, "reason": reason,
+            "reason_name": self.config.return_reason_name(reason),
+            "detail": payload.get("detail"), "items": payload.get("items", []),
+            "partial": bool(payload.get("items")),
+            "by": actor.get("name"), "at": now_iso(),
+        })
+        return {"handoff_id": handoff_id, "state": "returned"}
+
+    def _validate_return_reason(self, payload):
+        reason = payload.get("reason")
+        if reason not in self.config.handoff_return_reasons:
+            raise AppError(f"退回/拒收原因须为：{'、'.join(self.config.handoff_return_reasons)}")
+        return reason
+
+    def supplement_handoff(self, handoff_id, payload, actor):
+        """退回/拒收后的补件：生成新清单作为后续事件，范围与期限受原保全令约束，须重新核权。"""
+        _require(actor, (self.config.handoff["交出方角色"],))
+        handoff = self._handoff(handoff_id)
+        if handoff["state"] not in ("rejected", "returned",
+                                    "conflict_review", "supplement_required"):
+            raise AppError(f"当前状态 {handoff['state']} 不允许补件")
+        order = self._order(handoff["order_id"])
+        if order["status"] != "active":
+            raise AppError("原保全令已失效，补件前须换版签发")
+        if self._parse_iso(order["valid_until"]) <= self._parse_iso(now_iso()):
+            raise AppError("保全令授权期限已过，须先司法延期再补件", 409)
+        inc = self.incidents[handoff["incident_id"]]
+        self._assert_disclosure_open(inc)
+        self._assert_disclosure_authorized(inc)  # 新增披露重新核权
+
+        new_manifest = self._generate_manifest(order["order_id"],
+                                               supersedes_manifest=handoff["manifest_id"])
+        self._append("handoff_supplemented", {
+            "handoff_id": handoff_id, "manifest_id": new_manifest["manifest_id"],
+            "previous_manifest_id": handoff["manifest_id"],
+            "reason": payload.get("reason", "按退回意见补正材料"),
+            "by": actor.get("name"), "at": now_iso(),
+        })
+        # 补件作为后续事件衔接：状态回到待接收签认，原签认与回执均保留
+        # （投影由 _on_handoff_supplemented 经账本订阅更新）
+        return {"handoff_id": handoff_id, "state": "pending_receiver",
+                "manifest_id": new_manifest["manifest_id"],
+                "manifest_sha256": new_manifest["manifest_sha256"]}
+
+    def resolve_handoff_conflict(self, conflict_id, payload, actor):
+        """冲突复核：维持原清单（重复移交结案）或要求补件换版。"""
+        _require(actor, ("法务复核员", self.config.handoff["交出方角色"]))
+        conflict = self.conflicts.get(conflict_id)
+        if not conflict:
+            raise AppError("冲突记录不存在", 404)
+        if conflict["status"] != "open":
+            raise AppError("该冲突已复核")
+        decision = payload.get("decision")
+        if decision not in ("accept_existing", "require_supplement"):
+            raise AppError("decision 仅支持 accept_existing/require_supplement")
+        self._append("handoff_conflict_resolved", {
+            "conflict_id": conflict_id, "handoff_id": conflict["handoff_id"],
+            "decision": decision, "note": payload.get("note"),
+            "by": actor.get("name"), "at": now_iso(),
+        })
+        return {"conflict_id": conflict_id, "decision": decision}
+
+    # ------------------------------------------------------------- 断点/查询
+    def handoff_resume_point(self, handoff_id):
+        """服务中断后从最后确认节点恢复：返回当前状态、最后账本序号与最后签认节点。"""
+        handoff = self._handoff(handoff_id)
+        last_confirmed = None
+        if handoff["receiver_ack"]:
+            last_confirmed = {"node": "receiver_acknowledged", **handoff["receiver_ack"]}
+        elif handoff["surrender_ack"]:
+            last_confirmed = {"node": "surrender_acknowledged", **handoff["surrender_ack"]}
+        else:
+            last_confirmed = {"node": "handoff_created", "at": handoff["created_at"]}
+        return {"handoff_id": handoff_id, "state": handoff["state"],
+                "last_event_seq": handoff["last_event_seq"],
+                "ledger_last_seq": self._last_seq,
+                "last_confirmed_node": last_confirmed}
+
+    def handoff_view(self, handoff_id, as_role=None):
+        handoff = self._handoff(handoff_id)
+        order = self.orders[handoff["order_id"]]
+        manifest = self.manifests[handoff["manifest_id"]]
+        view = {
+            "handoff_id": handoff_id, "incident_id": handoff["incident_id"],
+            "state": handoff["state"], "purpose": handoff["purpose"],
+            "purpose_name": self.config.purpose_name(handoff["purpose"]),
+            "receiver_org": handoff["receiver_org"],
+            "handover_by": handoff["handover_by"],
+            "order": {"order_id": order["order_id"], "version": order["version"],
+                      "valid_until": order["valid_until"], "extensions": order["extensions"]},
+            "manifest_id": manifest["manifest_id"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "summary": manifest["summary"],
+            "items": self._mask_items(manifest["items"], as_role),
+            "surrender_ack": handoff["surrender_ack"],
+            "receiver_ack": handoff["receiver_ack"],
+            "rejection": handoff["rejection"],
+            "returned": handoff["returned"],
+            "supplement_of": handoff.get("supplement_of"),
+            "event_chain": handoff["events"],
+            "resume": self.handoff_resume_point(handoff_id),
+        }
+        return view
+
+    def _mask_items(self, items, as_role):
+        if as_role != "普通案件查看者":
+            return items
+        placeholder = self.config.handoff_mask_placeholder
+        masked_fields = set(self.config.handoff_mask_fields)
+        out = []
+        for item in items:
+            data = {k: (placeholder if k in masked_fields else v)
+                    for k, v in item["data"].items()}
+            out.append({"category": item["category"], "item_id": item["item_id"], "data": data})
+        return out
+
+    def list_handoffs(self, incident_id=None, state=None):
+        out = []
+        for handoff in self.handoffs.values():
+            if incident_id and handoff["incident_id"] != incident_id:
+                continue
+            if state and handoff["state"] != state:
+                continue
+            out.append({"handoff_id": handoff["handoff_id"],
+                        "incident_id": handoff["incident_id"],
+                        "state": handoff["state"], "purpose": handoff["purpose"],
+                        "order_id": handoff["order_id"],
+                        "manifest_id": handoff["manifest_id"],
+                        "receiver_org": handoff["receiver_org"]})
+        return out
+
+    def list_preservation_orders(self, incident_id=None):
+        out = []
+        for order in self.orders.values():
+            if incident_id and order["incident_id"] != incident_id:
+                continue
+            out.append({"order_id": order["order_id"], "incident_id": order["incident_id"],
+                        "version": order["version"], "status": order["status"],
+                        "purpose": order["purpose"], "valid_until": order["valid_until"],
+                        "superseded_by": order["superseded_by"],
+                        "manifest_ids": order["manifest_ids"]})
+        return out
+
+    def case_traceability(self, incident_id, as_role=None):
+        """案件追溯：逐项说明为何保全、由谁保管、何时到期、缺哪些外部回执；按角色脱敏。"""
+        inc = self._get_incident(incident_id)
+        viewer_limited = as_role == "普通案件查看者"
+        placeholder = self.config.handoff_mask_placeholder
+        material_index = {}
+        for order_id in inc["preservation_orders"]:
+            order = self.orders[order_id]
+            seen_in_order = set()
+            for manifest_id in order["manifest_ids"]:
+                manifest = self.manifests[manifest_id]
+                for item in manifest["items"]:
+                    if item["category"] not in ("evidence", "account", "receipt"):
+                        continue
+                    key = f"{item['category']}|{item['item_id']}"
+                    if key in seen_in_order:
+                        continue
+                    seen_in_order.add(key)
+                    record = material_index.setdefault(key, {
+                        "item": key, "category": item["category"],
+                        "item_id": item["item_id"], "preserved_by_orders": []})
+                    record["preserved_by_orders"].append({
+                        "order_id": order_id, "version": order["version"],
+                        "purpose": order["purpose"],
+                        "purpose_name": self.config.purpose_name(order["purpose"]),
+                        "why": f"依{order['version']}版保全令按"
+                               f"{self.config.purpose_name(order['purpose'])}用途依法保全",
+                        "custodian": self.config.handoff["交出方角色"],
+                        "issued_by": order["issued_by"],
+                        "valid_from": order["valid_from"],
+                        "retention_until": order["valid_until"],
+                        "extensions": order["extensions"],
+                        "manifest_id": manifest_id,
+                    })
+
+        materials = list(material_index.values())
+        for record in materials:
+            record["retention_until"] = max(
+                (o["retention_until"] for o in record["preserved_by_orders"]),
+                default=None)
+            if viewer_limited:
+                record["item_id"] = placeholder
+
+        external_followups = []
+        missing_receipts = []
+        for handoff_id in inc["handoffs"]:
+            handoff = self.handoffs[handoff_id]
+            external_followups.append({
+                "handoff_id": handoff_id, "state": handoff["state"],
+                "receiver_org": (placeholder if viewer_limited else handoff["receiver_org"]),
+                "purpose": handoff["purpose"],
+                "surrender_ack": handoff["surrender_ack"],
+                "receiver_ack": (None if viewer_limited else handoff["receiver_ack"]),
+                "rejection": handoff["rejection"], "returned": handoff["returned"],
+            })
+            if not handoff["receiver_ack"] and handoff["state"] not in ("rejected",):
+                missing_receipts.append({
+                    "handoff_id": handoff_id,
+                    "missing": "receiver_acknowledgement",
+                    "detail": f"接收机构 {handoff['receiver_org']} 尚未签认接收",
+                    "state": handoff["state"]})
+            open_conflicts = [c for c in self.conflicts.values()
+                              if c["handoff_id"] == handoff_id and c["status"] == "open"]
+            for conflict in open_conflicts:
+                missing_receipts.append({
+                    "handoff_id": handoff_id, "missing": "conflict_resolution",
+                    "detail": f"冲突 {conflict['conflict_id']} 待复核",
+                    "state": handoff["state"]})
+
+        return {
+            "incident_id": incident_id,
+            "as_role": as_role,
+            "masked": viewer_limited,
+            "materials": materials,
+            "external_followups": external_followups,
+            "missing_external_receipts": missing_receipts,
+            "minimal_retention_fields": self.config.handoff["最小保全字段"],
+        }
+
     # ------------------------------------------------------------------ 查询
     def _get_incident(self, incident_id):
         inc = self.incidents.get(incident_id)
@@ -914,6 +1619,17 @@ class SafeguardingApp:
             },
             "值班升级": inc["escalation"],
             "申诉": inc["appeal"],
+            "外部移交保全": {
+                "preservation_orders": [
+                    {"order_id": self.orders[o]["order_id"],
+                     "version": self.orders[o]["version"],
+                     "status": self.orders[o]["status"],
+                     "purpose": self.orders[o]["purpose"],
+                     "valid_until": self.orders[o]["valid_until"]}
+                    for o in inc["preservation_orders"]],
+                "handoffs": [self.handoffs[h]["state"] for h in inc["handoffs"]],
+                "handoff_ids": list(inc["handoffs"]),
+            },
             "责任链": self._timeline(inc, mask),
         }
         if inc.get("closed_at"):

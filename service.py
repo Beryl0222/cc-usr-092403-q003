@@ -64,6 +64,20 @@ def build_handler(app):
                     incident_id = parsed.path.split("/")[2]
                     self._send_json(200, app.incident_digest(
                         incident_id, as_role=query.get("as_role")))
+                elif parsed.path.startswith("/incidents/") and parsed.path.endswith("/traceability"):
+                    incident_id = parsed.path.split("/")[2]
+                    self._send_json(200, app.case_traceability(
+                        incident_id, as_role=query.get("as_role")))
+                elif parsed.path == "/preservation-orders":
+                    self._send_json(200, {"orders": app.list_preservation_orders(
+                        incident_id=query.get("incident_id"))})
+                elif parsed.path == "/handoffs":
+                    self._send_json(200, {"handoffs": app.list_handoffs(
+                        incident_id=query.get("incident_id"), state=query.get("state"))})
+                elif parsed.path.startswith("/handoffs/"):
+                    handoff_id = parsed.path.split("/")[2]
+                    self._send_json(200, app.handoff_view(
+                        handoff_id, as_role=query.get("as_role")))
                 elif parsed.path == "/suggestions":
                     self._send_json(200, {"suggestions": app.list_suggestions(
                         status=query.get("status", "open"))})
@@ -126,6 +140,14 @@ def build_handler(app):
                         result = app.grant_consent(incident_id, body.get("scopes", []), actor)
                     elif rest == ["consent", "revoke"]:
                         result = app.revoke_consent(incident_id, body.get("scopes", []), actor)
+                    elif rest == ["preservation-orders"]:
+                        result = app.issue_preservation_order(incident_id, body, actor)
+                        self._send_json(201, result)
+                        return
+                    elif rest == ["handoffs"]:
+                        result = app.create_handoff(incident_id, body, actor)
+                        self._send_json(201, result)
+                        return
                     elif rest == ["appeal"]:
                         app.open_appeal(incident_id, body.get("reason", ""), actor)
                         result = {"status": "申诉中"}
@@ -159,6 +181,41 @@ def build_handler(app):
                     result = app.resolve_suggestion(
                         parts[1], body.get("decision"), actor,
                         target_incident=body.get("target_incident"))
+                    self._send_json(200, result)
+
+                elif len(parts) == 3 and parts[0] == "preservation-orders" and parts[2] == "extend":
+                    actor = self._actor(body)
+                    result = app.extend_preservation_order(parts[1], body, actor)
+                    self._send_json(200, result)
+
+                elif len(parts) >= 3 and parts[0] == "handoffs":
+                    handoff_id = parts[1]
+                    action = parts[2]
+                    if len(parts) != 3:
+                        self._send_json(404, {"error": "移交子路由不存在", "path": path})
+                        return
+                    actor = self._actor(body)
+                    if action == "surrender-ack":
+                        result = app.acknowledge_surrender(handoff_id, actor)
+                    elif action == "receiver-ack":
+                        result = app.acknowledge_handoff(
+                            handoff_id, actor, note=body.get("note"))
+                    elif action == "reject":
+                        result = app.reject_handoff(handoff_id, body, actor)
+                    elif action == "return":
+                        result = app.return_handoff(handoff_id, body, actor)
+                    elif action == "supplement":
+                        result = app.supplement_handoff(handoff_id, body, actor)
+                    elif action == "resume":
+                        result = app.handoff_resume_point(handoff_id)
+                    else:
+                        self._send_json(404, {"error": "移交子路由不存在", "path": path})
+                        return
+                    self._send_json(200, result)
+
+                elif len(parts) == 3 and parts[0] == "conflicts" and parts[2] == "resolve":
+                    actor = self._actor(body)
+                    result = app.resolve_handoff_conflict(parts[1], body, actor)
                     self._send_json(200, result)
 
                 else:
